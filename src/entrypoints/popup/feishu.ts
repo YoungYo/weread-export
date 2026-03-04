@@ -301,11 +301,23 @@ async function appendBlocks(docToken: string, token: string, children: FeishuBlo
   }
 }
 
-export async function overwriteDocWithMarkdown(docToken: string, token: string, markdown: string): Promise<void> {
-  const items = await listRootBlocks(docToken, token);
-  if (items.length > 0) {
+async function clearRootBlocks(docToken: string, token: string): Promise<void> {
+  const MAX_ROUNDS = 200;
+
+  for (let i = 0; i < MAX_ROUNDS; i += 1) {
+    const items = await listRootBlocks(docToken, token);
+    if (items.length === 0) {
+      return;
+    }
+
     await deleteBlocksByIndexRange(docToken, token, 0, items.length);
   }
+
+  throw new Error("清空飞书文档失败：删除轮次过多，请重试。若持续失败，请检查文档是否在被其他人同时编辑。");
+}
+
+export async function overwriteDocWithMarkdown(docToken: string, token: string, markdown: string): Promise<void> {
+  await clearRootBlocks(docToken, token);
 
   const blocks = markdownToBlocks(markdown);
   await appendBlocks(docToken, token, blocks);
