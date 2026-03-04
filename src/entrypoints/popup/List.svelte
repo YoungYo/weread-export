@@ -24,7 +24,13 @@
     message: "请先选择书籍并配置飞书参数。",
   };
 
-  $: allSelected = books.length > 0 && selectedBookIds.size === books.length;
+  let bookQuery = "";
+
+  $: normalizedBookQuery = bookQuery.trim().toLowerCase();
+  $: filteredBooks = normalizedBookQuery
+    ? books.filter((book) => `${book.title ?? ""} ${book.author ?? ""}`.toLowerCase().includes(normalizedBookQuery))
+    : books;
+  $: allSelected = filteredBooks.length > 0 && filteredBooks.every((book) => selectedBookIds.has(book.bookId));
 
   async function init() {
     try {
@@ -56,10 +62,13 @@
 
   function toggleAll(checked: boolean) {
     if (checked) {
-      selectedBookIds = new Set(books.map((book) => book.bookId));
-    } else {
-      selectedBookIds = new Set();
+      selectedBookIds = new Set(filteredBooks.map((book) => book.bookId));
+      return;
     }
+
+    const next = new Set(selectedBookIds);
+    filteredBooks.forEach((book) => next.delete(book.bookId));
+    selectedBookIds = next;
   }
 
   async function persistConfig() {
@@ -178,13 +187,19 @@
       </label>
     </div>
 
+    {#if !loadingBooks && books.length > 0}
+      <input class="book-search" bind:value={bookQuery} placeholder="搜索书名或作者（模糊匹配）" />
+    {/if}
+
     {#if loadingBooks}
       <div class="status">正在加载书籍...</div>
     {:else if books.length === 0}
       <div class="status">未找到可同步书籍，请确认微信读书账号有笔记。</div>
+    {:else if filteredBooks.length === 0}
+      <div class="status">没有匹配的书籍，请调整搜索关键词。</div>
     {:else}
       <div class="books">
-        {#each books as book (book.bookId)}
+        {#each filteredBooks as book (book.bookId)}
           <label class="book-item">
             <input
               type="checkbox"
@@ -285,6 +300,11 @@
     margin-bottom: 10px;
   }
 
+  .book-search {
+    width: 100%;
+    margin: 0 0 10px;
+  }
+
   .select-all {
     display: inline-flex;
     align-items: center;
@@ -298,6 +318,7 @@
     width: auto;
     margin: 0;
   }
+
 
   .books {
     max-height: 410px;
