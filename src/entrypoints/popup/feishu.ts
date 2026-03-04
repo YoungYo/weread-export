@@ -21,19 +21,95 @@ function sanitizeJsonText(raw: string): string {
     .trim();
 }
 
-async function readJsonResponse(response: Response, action: string): Promise<JsonObject> {
-  const raw = await response.text();
-  const cleaned = sanitizeJsonText(raw);
+const MAX_RATE_LIMIT_RETRIES = 6;
+const BASE_RETRY_DELAY_MS = 1000;
+const MAX_RETRY_DELAY_MS = 15000;
+const MIN_REQUEST_INTERVAL_MS = 350;
 
-  if (!cleaned) {
-    throw new Error(`${action} failed: empty response (HTTP ${response.status})`);
+let lastRequestTime = 0;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function throttle(): Promise<void> {
+  const now = Date.now();
+  const elapsed = now - lastRequestTime;
+  if (elapsed < MIN_REQUEST_INTERVAL_MS) {
+    await sleep(MIN_REQUEST_INTERVAL_MS - elapsed);
+  }
+  lastRequestTime = Date.now();
+}
+
+function parseRetryAfterMs(response: Response): number | null {
+  const retryAfter = response.headers.get("Retry-After");
+  if (!retryAfter) return null;
+
+  const seconds = Number(retryAfter);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.floor(seconds * 1000);
   }
 
-  try {
-    return JSON.parse(cleaned) as JsonObject;
-  } catch {
-    throw new Error(`${action} 返回了非 JSON 响应（HTTP ${response.status}）：${raw.slice(0, 180)}`);
+  const dateMs = Date.parse(retryAfter);
+  if (Number.isFinite(dateMs)) {
+    return Math.max(0, dateMs - Date.now());
   }
+
+  return null;
+}
+
+function getRetryDelayMs(response: Response, attempt: number): number {
+  const byHeader = parseRetryAfterMs(response);
+  if (byHeader !== null) {
+    return Math.min(MAX_RETRY_DELAY_MS, byHeader);
+  }
+
+  const jitter = Math.floor(Math.random() * 300);
+  const backoff = BASE_RETRY_DELAY_MS * Math.pow(2, attempt);
+  return Math.min(MAX_RETRY_DELAY_MS, backoff + jitter);
+}
+
+function isRateLimited(response: Response, body: JsonObject | null): boolean {
+  if (response.status === 429) return true;
+  if (response.status === 400 && body?.code === 99991400) return true;
+  return false;
+}
+
+async function fetchWithRateLimitRetry(url: string, init: RequestInit, action: string): Promise<{ response: Response; body: JsonObject }> {
+  for (let attempt = 0; attempt <= MAX_RATE_LIMIT_RETRIES; attempt += 1) {
+    await throttle();
+
+    const response = await fetch(url, init);
+    const raw = await response.text();
+    const cleaned = sanitizeJsonText(raw);
+
+    let body: JsonObject | null = null;
+    if (cleaned) {
+      try {
+        body = JSON.parse(cleaned) as JsonObject;
+      } catch {
+        // non-JSON response, will be handled below
+      }
+    }
+
+    if (!isRateLimited(response, body)) {
+      if (!cleaned) {
+        throw new Error(`${action} failed: empty response (HTTP ${response.status})`);
+      }
+      if (!body) {
+        throw new Error(`${action} 返回了非 JSON 响应（HTTP ${response.status}）：${raw.slice(0, 180)}`);
+      }
+      return { response, body };
+    }
+
+    if (attempt === MAX_RATE_LIMIT_RETRIES) {
+      throw new Error(`${action} failed: 请求过于频繁，已重试 ${MAX_RATE_LIMIT_RETRIES} 次仍被限流，请稍后重试。`);
+    }
+
+    await sleep(getRetryDelayMs(response, attempt));
+  }
+
+  throw new Error(`${action} failed: unexpected retry state`);
 }
 
 function ensureOk<T extends { code?: number; msg?: string }>(res: T, action: string): T {
@@ -55,7 +131,7 @@ export async function getTenantAccessToken(input: FeishuAuthInput): Promise<stri
     throw new Error("Please provide App ID and App Secret, or an existing tenant_access_token.");
   }
 
-  const response = await fetch(`${FEISHU_API_BASE}/auth/v3/tenant_access_token/internal`, {
+  const { body } = await fetchWithRateLimitRetry(`${FEISHU_API_BASE}/auth/v3/tenant_access_token/internal`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -64,9 +140,9 @@ export async function getTenantAccessToken(input: FeishuAuthInput): Promise<stri
       app_id: input.appId,
       app_secret: input.appSecret,
     }),
-  });
+  }, "Get tenant_access_token");
 
-  const data = ensureOk(await readJsonResponse(response, "Get tenant_access_token"), "Get tenant_access_token");
+  const data = ensureOk(body, "Get tenant_access_token");
   const token = data.tenant_access_token;
   if (typeof token !== "string" || !token) {
     throw new Error("No tenant_access_token returned from Feishu.");
@@ -122,14 +198,18 @@ export async function resolveDocToken(docUrl: string, token: string): Promise<Fe
     };
   }
 
-  const response = await fetch(`${FEISHU_API_BASE}/wiki/v2/spaces/get_node?token=${encodeURIComponent(target.token)}`, {
-    method: "GET",
-    headers: {
-      Authorization: `Bearer ${token}`,
+  const { body } = await fetchWithRateLimitRetry(
+    `${FEISHU_API_BASE}/wiki/v2/spaces/get_node?token=${encodeURIComponent(target.token)}`,
+    {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
     },
-  });
+    "Get wiki node info",
+  );
 
-  const data = ensureOk(await readJsonResponse(response, "Get wiki node info"), "Get wiki node info");
+  const data = ensureOk(body, "Get wiki node info");
   const node = (data?.data as { node?: { obj_token?: unknown; obj_type?: unknown } })?.node;
   const objToken = typeof node?.obj_token === "string" ? node.obj_token.trim() : "";
   const objType = typeof node?.obj_type === "string" ? node.obj_type : "";
@@ -152,14 +232,18 @@ export async function listRootBlocks(
   docToken: string,
   token: string,
 ): Promise<Array<{ block_id: string; block_type?: number; parent_id?: string }>> {
-  const response = await fetch(`${FEISHU_API_BASE}/docx/v1/documents/${docToken}/blocks/${docToken}/children?page_size=500`, {
-    method: "GET",
-    headers: {
-      Authorization: `Bearer ${token}`,
+  const { body } = await fetchWithRateLimitRetry(
+    `${FEISHU_API_BASE}/docx/v1/documents/${docToken}/blocks/${docToken}/children?page_size=500`,
+    {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
     },
-  });
+    "List document blocks",
+  );
 
-  const data = ensureOk(await readJsonResponse(response, "List document blocks"), "List document blocks");
+  const data = ensureOk(body, "List document blocks");
   return (data?.data as { items?: Array<{ block_id: string; block_type?: number; parent_id?: string }> })?.items ?? [];
 }
 
@@ -168,19 +252,23 @@ export async function deleteBlocksByIndexRange(docToken: string, token: string, 
     return;
   }
 
-  const response = await fetch(`${FEISHU_API_BASE}/docx/v1/documents/${docToken}/blocks/${docToken}/children/batch_delete`, {
-    method: "DELETE",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
+  const { body } = await fetchWithRateLimitRetry(
+    `${FEISHU_API_BASE}/docx/v1/documents/${docToken}/blocks/${docToken}/children/batch_delete`,
+    {
+      method: "DELETE",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        start_index: startIndex,
+        end_index: endIndex,
+      }),
     },
-    body: JSON.stringify({
-      start_index: startIndex,
-      end_index: endIndex,
-    }),
-  });
+    "Delete document blocks",
+  );
 
-  ensureOk(await readJsonResponse(response, "Delete document blocks"), "Delete document blocks");
+  ensureOk(body, "Delete document blocks");
 }
 
 type FeishuBlock = Record<string, unknown>;
@@ -288,16 +376,20 @@ async function appendBlocks(docToken: string, token: string, children: FeishuBlo
   for (let start = 0; start < children.length; start += BATCH_SIZE) {
     const batch = children.slice(start, start + BATCH_SIZE);
 
-    const response = await fetch(`${FEISHU_API_BASE}/docx/v1/documents/${docToken}/blocks/${docToken}/children`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
+    const { body } = await fetchWithRateLimitRetry(
+      `${FEISHU_API_BASE}/docx/v1/documents/${docToken}/blocks/${docToken}/children`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ children: batch }),
       },
-      body: JSON.stringify({ children: batch }),
-    });
+      "Create document blocks",
+    );
 
-    ensureOk(await readJsonResponse(response, "Create document blocks"), "Create document blocks");
+    ensureOk(body, "Create document blocks");
   }
 }
 
