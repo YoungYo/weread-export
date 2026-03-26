@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { downloadMarkdownFile } from "./export";
   import { getTenantAccessToken, overwriteDocWithMarkdown, resolveDocToken } from "./feishu";
   import { loadConfig, saveConfig } from "./storage";
   import type { BookBrief, FeishuConfig, SyncState } from "./types";
@@ -21,7 +22,7 @@
 
   let syncState: SyncState = {
     status: "idle",
-    message: "请先选择书籍并配置飞书参数。",
+    message: "先试试本地 Markdown 导出；飞书同步仍为覆盖原文档模式。",
   };
 
   let bookQuery = "";
@@ -31,6 +32,7 @@
     ? books.filter((book) => `${book.title ?? ""} ${book.author ?? ""}`.toLowerCase().includes(normalizedBookQuery))
     : books;
   $: allSelected = filteredBooks.length > 0 && filteredBooks.every((book) => selectedBookIds.has(book.bookId));
+  $: selectedCount = selectedBookIds.size;
 
   async function init() {
     try {
@@ -75,7 +77,13 @@
     await saveConfig(config);
   }
 
-  function ensureInputValid() {
+  function ensureBooksSelected() {
+    if (selectedBookIds.size === 0) {
+      throw new Error("请至少选择一本书");
+    }
+  }
+
+  function ensureFeishuInputValid() {
     if (!config.docUrl.trim()) {
       throw new Error("请填写飞书文档地址");
     }
@@ -83,19 +91,53 @@
     if (!config.tenantAccessToken.trim() && (!config.appId.trim() || !config.appSecret.trim())) {
       throw new Error("请填写 AppId + AppSecret，或直接填写 tenant_access_token");
     }
+  }
 
-    if (selectedBookIds.size === 0) {
-      throw new Error("请至少选择一本书");
+  function getSelectedBooks(): BookBrief[] {
+    ensureBooksSelected();
+    return books.filter((book) => selectedBookIds.has(book.bookId));
+  }
+
+  async function exportToMarkdown() {
+    try {
+      const ordered = getSelectedBooks();
+      syncState = {
+        status: "running",
+        message: `正在导出 ${ordered.length} 本书为 Markdown...`,
+      };
+
+      for (let i = 0; i < ordered.length; i += 1) {
+        const book = ordered[i];
+        syncState = {
+          status: "running",
+          message: `正在导出（${i + 1}/${ordered.length}）：${book.title}`,
+        };
+
+        const markdown = await fetchBookMarkdown(book.bookId, userVid);
+        await downloadMarkdownFile(book.title, markdown);
+      }
+
+      syncState = {
+        status: "done",
+        message: `导出完成，已生成 ${ordered.length} 个 Markdown 文件。`,
+      };
+    } catch (error) {
+      console.error(error);
+      syncState = {
+        status: "error",
+        message: error instanceof Error ? error.message : "导出失败，请重试。",
+      };
     }
   }
 
   async function syncToFeishu() {
     try {
-      ensureInputValid();
+      const ordered = getSelectedBooks();
+      ensureFeishuInputValid();
 
       syncState = {
         status: "running",
-        message: `正在同步 ${selectedBookIds.size} 本书...`,
+        message: `正在同步 ${ordered.length} 本书到飞书（覆盖原文档）...`,
       };
 
       await persistConfig();
@@ -107,7 +149,6 @@
       });
       const { docToken } = await resolveDocToken(config.docUrl, token);
 
-      const ordered = books.filter((book) => selectedBookIds.has(book.bookId));
       const markdownPieces: string[] = [];
 
       for (let i = 0; i < ordered.length; i += 1) {
@@ -147,23 +188,33 @@
 
 <div class="topbar">
   <div class="title-wrap">
-    <div class="title">微信读书 -> 飞书文档</div>
+    <div>
+      <div class="title">微信读书笔记导出</div>
+      <div class="subtitle">先导出本地 Markdown；飞书同步作为高级用法保留。</div>
+    </div>
     <a class="help-link" href="https://my.feishu.cn/docx/FmaLd3ugyobkZux7jbUc6qQPn0e" target="_blank" rel="noreferrer">
       帮助文档
     </a>
   </div>
-  <button class="sync-btn" on:click={syncToFeishu} disabled={loadingBooks || configLoading || syncState.status === "running"}>
-    {#if syncState.status === "running"}
-      同步中...
-    {:else}
-      开始同步（覆盖原文档）
-    {/if}
-  </button>
+
+  <div class="action-group">
+    <button class="export-btn" on:click={exportToMarkdown} disabled={loadingBooks || syncState.status === "running"}>
+      导出 Markdown（本地）
+    </button>
+    <button class="sync-btn" on:click={syncToFeishu} disabled={loadingBooks || configLoading || syncState.status === "running"}>
+      同步到飞书（覆盖原文档）
+    </button>
+  </div>
+</div>
+
+<div class="hero-tip">
+  <strong>推荐先试本地导出：</strong>
+  无需飞书配置，适合先验证导出效果；飞书同步会覆盖目标文档原有内容。
 </div>
 
 <div class="layout">
   <section class="panel">
-    <h3>飞书配置</h3>
+    <h3>飞书配置（仅飞书同步需要）</h3>
     <label>
       文档地址
       <input bind:value={config.docUrl} placeholder="https://xxx.feishu.cn/docx/xxxx 或 /wiki/xxxx" on:change={persistConfig} />
@@ -181,6 +232,15 @@
       <input bind:value={config.tenantAccessToken} placeholder="可直接粘贴，优先使用" type="password" on:change={persistConfig} />
     </label>
     <p class="hint">可二选一：`AppId + AppSecret` 或 `tenant_access_token`。</p>
+
+    <div class="warning-box">
+      <div class="warning-title">飞书同步风险提示</div>
+      <ul>
+        <li>当前是<strong>覆盖原文档</strong>模式，不是增量同步。</li>
+        <li>建议先用测试文档验证排版、权限和 token。</li>
+        <li>同步中断时，目标文档可能处于部分写入状态。</li>
+      </ul>
+    </div>
   </section>
 
   <section class="panel">
@@ -194,6 +254,7 @@
 
     {#if !loadingBooks && books.length > 0}
       <input class="book-search" bind:value={bookQuery} placeholder="搜索书名或作者（模糊匹配）" />
+      <div class="selected-tip">当前已选择 {selectedCount} 本书</div>
     {/if}
 
     {#if loadingBooks}
@@ -235,7 +296,7 @@
 <style>
   .topbar {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: space-between;
     gap: 12px;
     margin-bottom: 14px;
@@ -243,7 +304,7 @@
 
   .title-wrap {
     display: flex;
-    align-items: baseline;
+    align-items: flex-start;
     gap: 10px;
     min-width: 0;
   }
@@ -254,19 +315,33 @@
     color: #12213a;
   }
 
+  .subtitle {
+    margin-top: 4px;
+    font-size: 12px;
+    color: #64748b;
+  }
+
   .help-link {
     font-size: 12px;
     color: #2563eb;
     text-decoration: none;
     white-space: nowrap;
+    margin-top: 2px;
   }
 
   .help-link:hover {
     text-decoration: underline;
   }
 
+  .action-group {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+
+  .export-btn,
   .sync-btn {
-    background: linear-gradient(120deg, #0d9488, #2563eb);
     color: #fff;
     border: none;
     border-radius: 10px;
@@ -276,9 +351,28 @@
     margin: 0;
   }
 
+  .export-btn {
+    background: linear-gradient(120deg, #0f766e, #14b8a6);
+  }
+
+  .sync-btn {
+    background: linear-gradient(120deg, #b45309, #ea580c);
+  }
+
+  .export-btn:disabled,
   .sync-btn:disabled {
     opacity: 0.6;
     cursor: not-allowed;
+  }
+
+  .hero-tip {
+    margin-bottom: 14px;
+    border-radius: 12px;
+    padding: 12px 14px;
+    background: #ecfeff;
+    border: 1px solid #a5f3fc;
+    color: #155e75;
+    font-size: 13px;
   }
 
   .layout {
@@ -322,6 +416,29 @@
     font-size: 12px;
   }
 
+  .warning-box {
+    margin-top: 12px;
+    border-radius: 10px;
+    border: 1px solid #fdba74;
+    background: #fff7ed;
+    padding: 10px 12px;
+  }
+
+  .warning-title {
+    font-size: 13px;
+    font-weight: 700;
+    color: #9a3412;
+    margin-bottom: 6px;
+  }
+
+  .warning-box ul {
+    margin: 0;
+    padding-left: 18px;
+    color: #9a3412;
+    font-size: 12px;
+    line-height: 1.5;
+  }
+
   .book-header {
     display: flex;
     align-items: center;
@@ -332,7 +449,13 @@
 
   .book-search {
     width: 100%;
-    margin: 0 0 10px;
+    margin: 0 0 8px;
+  }
+
+  .selected-tip {
+    font-size: 12px;
+    color: #475569;
+    margin-bottom: 10px;
   }
 
   .select-all {
@@ -348,7 +471,6 @@
     width: auto;
     margin: 0;
   }
-
 
   .books {
     max-height: 410px;
@@ -466,6 +588,20 @@
   }
 
   @media (max-width: 900px) {
+    .topbar {
+      flex-direction: column;
+    }
+
+    .action-group {
+      width: 100%;
+      justify-content: stretch;
+    }
+
+    .export-btn,
+    .sync-btn {
+      flex: 1;
+    }
+
     .layout {
       grid-template-columns: 1fr;
     }

@@ -9,7 +9,7 @@ export default defineConfig({
     version: "0.1.0",
     homepage_url: "https://github.com/YoungYo/weread-to-feishu",
     host_permissions: ["https://weread.qq.com/*", "https://open.feishu.cn/*"],
-    permissions: ["storage"],
+    permissions: ["storage", "downloads"],
   },
   vite: () => ({
     plugins: [
